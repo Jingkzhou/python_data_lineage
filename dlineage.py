@@ -3,6 +3,8 @@ import os
 import webbrowser
 import jpype
 import sys
+import glob
+
 
 def get_file_character_count(file_path):
     character_count = 0
@@ -41,11 +43,21 @@ def save_to_file(file_name, contents):
     fh.close()
 
 def call_dataFlowAnalyzer(args):
-    # Start the Java Virtual Machine (JVM)
+     # Start the Java Virtual Machine (JVM)
     widget_server_url = "http://localhost:8000"
-    jvm = jpype.getDefaultJVMPath()
-    jar = "-Djava.class.path=jar/gudusoft.gsqlparser-2.8.5.8.jar"
-    jpype.startJVM(jvm, "-ea", jar)
+    jvm_path = jpype.getDefaultJVMPath()
+
+    # 扫描项目 jar/ 目录下的所有 .jar
+    curdir = os.path.dirname(__file__)
+    jar_dir = os.path.join(curdir, 'jar')
+    project_jars = glob.glob(os.path.join(jar_dir, '*.jar'))
+
+    # 构建 classpath 参数
+    classpath = os.pathsep.join(project_jars)
+    classpath_arg = "-Djava.class.path=" + classpath
+
+    # 启动 JVM（只传 classpath_arg）
+    jpype.startJVM(jvm_path, "-ea", classpath_arg)
 
     try:
         TGSqlParser = jpype.JClass("gudusoft.gsqlparser.TGSqlParser")

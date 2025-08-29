@@ -24,7 +24,11 @@ and generate an ER Diagram.
 By executing this command:
 ```
 python dlineage.py /t oracle /f test.sql /graph
+python3 dlineage.py /t oracle /f test.sql /graph
 ```
+cd widget 
+python3 -m http.server 8000
+
 
 We can automatically obtain the data lineage relationships contained in the following Oracle SQL statement.
 ```sql
