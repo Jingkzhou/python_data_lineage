@@ -45,7 +45,17 @@ def save_to_file(file_name, contents):
 def call_dataFlowAnalyzer(args):
      # Start the Java Virtual Machine (JVM)
     widget_server_url = "http://localhost:8000"
-    jvm_path = jpype.getDefaultJVMPath()
+    
+    # 尝试使用Java 8，如果不可用则使用默认版本
+    try:
+        java_home = "/Users/work/Library/Java/JavaVirtualMachines/corretto-1.8.0_392/Contents/Home"
+        if os.path.exists(java_home):
+            os.environ['JAVA_HOME'] = java_home
+            jvm_path = jpype.getDefaultJVMPath()
+        else:
+            jvm_path = jpype.getDefaultJVMPath()
+    except:
+        jvm_path = jpype.getDefaultJVMPath()
 
     # 扫描项目 jar/ 目录下的所有 .jar
     curdir = os.path.dirname(__file__)
@@ -56,8 +66,13 @@ def call_dataFlowAnalyzer(args):
     classpath = os.pathsep.join(project_jars)
     classpath_arg = "-Djava.class.path=" + classpath
 
-    # 启动 JVM（只传 classpath_arg）
-    jpype.startJVM(jvm_path, "-ea", classpath_arg)
+    # 启动 JVM（Java 8兼容的参数）
+    jvm_args = [
+        "-ea", 
+        classpath_arg,
+        "-Djava.awt.headless=true"
+    ]
+    jpype.startJVM(jvm_path, *jvm_args)
 
     try:
         TGSqlParser = jpype.JClass("gudusoft.gsqlparser.TGSqlParser")

@@ -134,7 +134,17 @@ if __name__ == '__main__':
 
     sql_files = sorted(glob.glob(os.path.join(sql_dir, '*.sql')))
     for src_sql in sql_files:
-        raw = open(src_sql, encoding='utf-8').read()
+        try:
+            # 尝试GB18030编码（中文国标编码）
+            raw = open(src_sql, encoding='gb18030').read()
+        except UnicodeDecodeError:
+            try:
+                # 如果GB18030失败，尝试GBK
+                raw = open(src_sql, encoding='gbk').read()
+            except UnicodeDecodeError:
+                # 最后尝试UTF-8
+                raw = open(src_sql, encoding='utf-8').read()
+        
         cleaned = preprocess_sql(raw)
         inserts = extract_insert_statements(cleaned)
         chunks = split_sql_chunks(inserts)
@@ -163,14 +173,6 @@ if __name__ == '__main__':
     cursor = conn.cursor()
 
     csv_files = glob.glob('chunks/*.csv')
-    conn = pymysql.connect(
-        host='127.0.0.1',
-        user='root',
-        password='a8548879',
-        database='lineage',
-        charset='utf8mb4'
-   )
-    cursor = conn.cursor()
     # 插入前清空表
     cursor.execute("TRUNCATE TABLE lineage_table;")
     conn.commit()
