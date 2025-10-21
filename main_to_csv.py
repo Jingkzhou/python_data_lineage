@@ -8,6 +8,7 @@ import csv
 import pymysql
 
 SQLFLOW_CHAR_LIMIT = int(os.getenv("SQLFLOW_CHAR_LIMIT", "10000"))
+EXPECTED_LINEAGE_COLUMNS = 14
 
 _FULLWIDTH_TRANS = str.maketrans({
     '（': '(',
@@ -72,6 +73,14 @@ def extract_table_name_from_insert(stmt: str) -> str:
     m = re.search(r'INSERT\s+INTO\s+([^\s(]+)', stmt, re.IGNORECASE)
     return m.group(1) if m else None
 
+def extract_table_name_from_create(stmt: str) -> str:
+    m = re.search(
+        r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:TEMPORARY\s+|TEMP\s+|EXTERNAL\s+)?([^\s(]+)',
+        stmt,
+        re.IGNORECASE
+    )
+    return m.group(1) if m else None
+
 def extract_insert_statements(sql: str) -> list[dict]:
     """返回 [{'table_name':..., 'sql':..., 'line_number':...}, ...]"""
     pat = re.compile(r"INSERT\s+INTO\s+(?:[^']|'[^']*')*?;", re.IGNORECASE | re.DOTALL)
@@ -85,9 +94,35 @@ def extract_insert_statements(sql: str) -> list[dict]:
         results.append({
             'table_name': tbl,
             'sql': match.strip(),
-            'line_number': lineno
+            'line_number': lineno,
+            'statement_type': 'insert'
         })
     logging.info(f"提取到 {len(results)} 条 INSERT 语句。")
+    return results
+
+CREATE_TABLE_AS_RE = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:TEMPORARY\s+|TEMP\s+|EXTERNAL\s+)?"
+    r"(?:[^;']|'[^']*')*?\bAS\s+(?:WITH\b(?:[^;']|'[^']*')*?SELECT|SELECT)"
+    r"(?:[^;']|'[^']*')*?;",
+    re.IGNORECASE | re.DOTALL
+)
+
+def extract_create_table_as_statements(sql: str) -> list[dict]:
+    """返回 CREATE TABLE ... AS 语句列表"""
+    results = []
+    for m in CREATE_TABLE_AS_RE.finditer(sql):
+        match = m.group(0)
+        tbl = extract_table_name_from_create(match)
+        if not tbl:
+            continue
+        lineno = sql[:m.start()].count('\n') + 1
+        results.append({
+            'table_name': tbl,
+            'sql': match.strip(),
+            'line_number': lineno,
+            'statement_type': 'create_table_as'
+        })
+    logging.info(f"提取到 {len(results)} 条 CREATE TABLE ... AS 语句。")
     return results
 
 
@@ -560,14 +595,26 @@ def split_insert_statement(insert_sql: str, max_len: int) -> list[str]:
     return output
 
 # ---------- 3. 拆分 SQL 片段 ----------
-def split_sql_chunks(inserts: list[dict], max_len: int = SQLFLOW_CHAR_LIMIT) -> list[str]:
+def split_sql_chunks(statements: list[dict], max_len: int = SQLFLOW_CHAR_LIMIT) -> list[str]:
     chunks: list[str] = []
-    for item in inserts:
-        statements = split_insert_statement(item['sql'], max_len=max_len)
-        if not statements:
-            logging.error(f"语句拆分失败（行 {item.get('line_number')}）。")
-            continue
-        for stmt in statements:
+    for item in statements:
+        stmt_type = item.get('statement_type', 'insert')
+        raw_sql = item['sql']
+        if stmt_type == 'insert':
+            pieces = split_insert_statement(raw_sql, max_len=max_len)
+            if not pieces:
+                logging.error(f"INSERT 语句拆分失败（行 {item.get('line_number')}）。")
+                continue
+        else:
+            normalized = raw_sql.strip()
+            if not normalized.endswith(';'):
+                normalized = normalized.rstrip(';').strip() + ';'
+            if len(normalized) > max_len:
+                logging.warning(
+                    f"语句长度 {len(normalized)} 超过 {max_len} 字符（行 {item.get('line_number')}，类型 {stmt_type}）。保留原语句。"
+                )
+            pieces = [normalized]
+        for stmt in pieces:
             stmt_text = stmt if stmt.endswith('\n') else f"{stmt}\n"
             chunks.append(stmt_text)
     logging.info(f"拆分为 {len(chunks)} 段，每段≤{max_len} 字符。")
@@ -691,6 +738,21 @@ def export_result_csvs(chunk_dir: str, result_dir: str = 'result') -> None:
         if writer:
             logging.info(f"已生成合并 CSV：{out_path}")
 
+
+def _normalize_lineage_row(row: list[str]) -> list[str] | None:
+    """dlineage 导出的 CSV 使用反引号包裹表达式，csv.reader 会把表达式拆成多列，这里合并回单列。"""
+    if len(row) == EXPECTED_LINEAGE_COLUMNS:
+        return row
+    if len(row) > EXPECTED_LINEAGE_COLUMNS >= 3:
+        prefix = row[:11]
+        suffix = row[-2:]
+        middle = ','.join(row[11:-2]).strip()
+        fixed = prefix + [middle] + suffix
+        if len(fixed) == EXPECTED_LINEAGE_COLUMNS:
+            return fixed
+    logging.warning(f"无法纠正 CSV 行列数：{len(row)} 列，期望 {EXPECTED_LINEAGE_COLUMNS}。数据：{row}")
+    return None
+
 # ---------- 主流程 ----------
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO,
@@ -717,8 +779,19 @@ if __name__ == '__main__':
                 raw = open(src_sql, encoding='utf-8').read()
         
         cleaned = preprocess_sql(raw)
-        inserts = extract_insert_statements(cleaned)
-        chunks = split_sql_chunks(inserts)
+        insert_statements = extract_insert_statements(cleaned)
+        create_statements = extract_create_table_as_statements(cleaned)
+        statements = sorted(
+            insert_statements + create_statements,
+            key=lambda item: item.get('line_number', 0)
+        )
+        if not statements:
+            logging.info(f"{src_sql} 未提取到 INSERT 或 CREATE TABLE ... AS 语句，跳过。")
+            continue
+        chunks = split_sql_chunks(statements)
+        if not chunks:
+            logging.warning(f"{src_sql} 的语句拆分结果为空，跳过。")
+            continue
 
         base_name = os.path.splitext(os.path.basename(src_sql))[0]
         for idx, seg in enumerate(chunks, start=1):
@@ -729,7 +802,7 @@ if __name__ == '__main__':
 
     # 生成每段 CSV
     generate_chunk_csvs(chunk_dir,
-                        db_type='oracle',
+                        db_type='hive',
                         dlineage_script='dlineage.py')
 
     # 将每个存储过程的 CSV 汇总到 result 目录
@@ -775,6 +848,11 @@ if __name__ == '__main__':
                 if not row or all(cell.strip() == '' for cell in row):
                     print(f"遇到空行，跳过整个文件：{csv_file}")
                     break   # 跳出本文件循环，继续下一个csv文件
+                normalized_row = _normalize_lineage_row(row)
+                if not normalized_row:
+                    print(f"无法解析列，跳过: {csv_file} 行内容: {row}")
+                    continue
+                row = normalized_row
                 ext_row = row + [sql_content, os.path.basename(sql_file)]
                 if len(ext_row) != len(fields):
                     print(f"字段数量不一致，跳过: {csv_file} 行内容: {ext_row}")
