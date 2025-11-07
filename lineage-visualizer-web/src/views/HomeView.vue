@@ -275,7 +275,7 @@ const collectStartFieldKeys = (): string[] => {
   return getFieldsForNode(nodeId).map((name) => fieldKey(nodeId, name))
 }
 
-const traverseGraph = (startKeys: string[]): HighlightResult => {
+const traverseDirectional = (startKeys: string[], map: Map<string, Neighbor[]>): HighlightResult => {
   const fieldKeys = new Set<string>()
   const nodeIds = new Set<string>()
   const edgeIds = new Set<string>()
@@ -304,8 +304,7 @@ const traverseGraph = (startKeys: string[]): HighlightResult => {
 
   while (queue.length) {
     const key = queue.shift() as string
-    visitNeighbors(key, downstreamMap)
-    visitNeighbors(key, upstreamMap)
+    visitNeighbors(key, map)
   }
 
   return { fieldKeys, nodeIds, edgeIds }
@@ -316,7 +315,20 @@ const computeHighlight = (): HighlightResult => {
     return { fieldKeys: new Set(), nodeIds: new Set(), edgeIds: new Set() }
   }
   const startKeys = collectStartFieldKeys()
-  return traverseGraph(startKeys)
+  const downstream = traverseDirectional(startKeys, downstreamMap)
+  const upstream = traverseDirectional(startKeys, upstreamMap)
+
+  const mergeSets = <T>(...sets: Set<T>[]) => {
+    const result = new Set<T>()
+    sets.forEach((set) => set.forEach((value) => result.add(value)))
+    return result
+  }
+
+  return {
+    fieldKeys: mergeSets(downstream.fieldKeys, upstream.fieldKeys),
+    nodeIds: mergeSets(downstream.nodeIds, upstream.nodeIds),
+    edgeIds: mergeSets(downstream.edgeIds, upstream.edgeIds),
+  }
 }
 
 const applyNodeHighlight = (highlight: HighlightResult) => {
