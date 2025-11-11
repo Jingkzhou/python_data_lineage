@@ -4,15 +4,12 @@ import { computed } from 'vue'
 import type { NodeProps } from '@vue-flow/core'
 import { Handle, Position } from '@vue-flow/core'
 
-type Field = {
-  name: string
-  direction?: 'in' | 'out' | 'both'
-}
+import type { LineageField } from '@/types/lineage'
 
 type TableNodeData = {
   tableName: string
   variant?: 'green' | 'magenta' | 'orange'
-  fields: Field[]
+  fields: LineageField[]
 }
 
 const props = defineProps<
@@ -48,10 +45,10 @@ const headerStyle = computed<CSSProperties>(() => ({
   background: colors.value.header,
 }))
 
-const makeHandleId = (field: Field, dir: 'in' | 'out') => `${props.id}-${field.name}-${dir}`
+const makeHandleId = (field: LineageField, dir: 'in' | 'out') => `${props.id}-${field.name}-${dir}`
 
-const allowsIn = (field: Field) => (field.direction ?? 'both') !== 'out'
-const allowsOut = (field: Field) => (field.direction ?? 'both') !== 'in'
+const allowsIn = (field: LineageField) => (field.direction ?? 'both') !== 'out'
+const allowsOut = (field: LineageField) => (field.direction ?? 'both') !== 'in'
 </script>
 
 <template>

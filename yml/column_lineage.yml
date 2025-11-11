@@ -1,0 +1,10 @@
+source:
+  type: file
+  config:
+    filename: ./column_lineage.json
+    file_type: json
+
+sink:
+  type: datahub-rest
+  config:
+    server: "http://localhost:8080"

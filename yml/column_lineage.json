@@ -1,0 +1,12 @@
+[
+  {
+    "entityType": "dataset",
+    "entityUrn": "urn:li:dataset:(urn:li:dataPlatform:oracle,btars_datacore.btars_rmb_current_account_temp,PROD)",
+    "changeType": "UPSERT",
+    "aspectName": "upstreamLineage",
+    "aspect": {
+      "value": "{\"upstreams\": [{\"dataset\": \"urn:li:dataset:(urn:li:dataPlatform:oracle,smtmods.l_publ_org_bra,PROD)\", \"type\": \"TRANSFORMED\"}], \"fineGrainedLineages\": [{\"upstreams\": [\"urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:oracle,smtmods.l_publ_org_bra,PROD),org_num)\"], \"downstreams\": [\"urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:oracle,btars_datacore.btars_rmb_current_account_temp,PROD),bank_code)\"], \"upstreamType\": \"FIELD_SET\", \"downstreamType\": \"FIELD_SET\", \"transformOperation\": \"copy\"}]}",
+      "contentType": "application/json"
+    }
+  }
+]

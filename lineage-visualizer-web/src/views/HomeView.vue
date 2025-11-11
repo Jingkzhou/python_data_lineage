@@ -1,17 +1,20 @@
 <script setup lang="ts">
 import { Background } from '@vue-flow/background'
 import type { Edge, Node, NodeTypes } from '@vue-flow/core'
-import { MarkerType, VueFlow } from '@vue-flow/core'
+import { MarkerType, VueFlow, useVueFlow } from '@vue-flow/core'
 import { Controls } from '@vue-flow/controls'
 import { MiniMap } from '@vue-flow/minimap'
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import TableNode from '../components/nodes/TableNode.vue'
+import { fetchLineageGraph } from '@/services/lineageClient'
+import { computeNodePositions } from '@/utils/lineageLayout'
+import type { LineageEdgeDTO, LineageField, LineageGraphDTO } from '@/types/lineage'
 
 type TableNodeData = {
   tableName: string
   variant?: 'green' | 'magenta' | 'orange'
-  fields: Array<{ name: string; direction?: 'in' | 'out' | 'both' }>
+  fields: LineageField[]
 }
 
 type InteractiveTableNodeData = TableNodeData & {
@@ -34,16 +37,39 @@ type HighlightResult = {
   edgeIds: Set<string>
 }
 
-const nodeTypes: NodeTypes = {
-  tableNode: TableNode,
-}
-
 type SelectionState = {
   nodeId: string
   field?: string
 } | null
 
+type Neighbor = { key: string; edgeId: string }
+
+const nodeTypes: NodeTypes = {
+  tableNode: TableNode,
+}
+
+const variantPalette: TableNodeData['variant'][] = ['green', 'magenta', 'orange']
+const pickVariant = (index: number) => variantPalette[index % variantPalette.length]
+
+const nodes = ref<Node<InteractiveTableNodeData>[]>([])
+const edges = ref<Edge<LineageEdgeData>[]>([])
+
 const selectedContext = ref<SelectionState>(null)
+const isLoading = ref(true)
+const loadError = ref<string | null>(null)
+
+const datasetStats = ref({
+  fileCount: 0,
+  nodeCount: 0,
+  edgeCount: 0,
+  updatedAt: '',
+})
+
+let baseEdges: Edge<LineageEdgeData>[] = []
+const downstreamMap = new Map<string, Neighbor[]>()
+const upstreamMap = new Map<string, Neighbor[]>()
+
+const { fitView } = useVueFlow()
 
 const selectTable = (nodeId: string) => {
   selectedContext.value = { nodeId }
@@ -57,7 +83,7 @@ const clearSelection = () => {
   selectedContext.value = null
 }
 
-const enhanceNode = (node: Node<TableNodeData>): Node<InteractiveTableNodeData> => ({
+const attachInteractions = (node: Node<TableNodeData>): Node<InteractiveTableNodeData> => ({
   ...node,
   data: {
     ...node.data,
@@ -66,175 +92,19 @@ const enhanceNode = (node: Node<TableNodeData>): Node<InteractiveTableNodeData> 
   },
 })
 
-const nodes = ref<Node<InteractiveTableNodeData>[]>([
-  {
-    id: 'customers',
-    type: 'tableNode',
-    position: { x: -520, y: -40 },
-    data: {
-      tableName: 'customers',
-      variant: 'green',
-      fields: [
-        { name: 'credit_limit', direction: 'out' },
-        { name: 'cust_email', direction: 'out' },
-      ],
-    },
-  },
-  {
-    id: 'orders',
-    type: 'tableNode',
-    position: { x: -520, y: 200 },
-    data: {
-      tableName: 'orders',
-      variant: 'green',
-      fields: [
-        { name: 'order_id', direction: 'out' },
-        { name: 'customer_id', direction: 'out' },
-        { name: 'order_total', direction: 'out' },
-        { name: 'sales_rep_id', direction: 'out' },
-      ],
-    },
-  },
-  {
-    id: 'insert_select',
-    type: 'tableNode',
-    position: { x: -120, y: 80 },
-    data: {
-      tableName: 'INSERT-SELECT-1',
-      variant: 'magenta',
-      fields: [
-        { name: 'oid', direction: 'both' },
-        { name: 'cid', direction: 'both' },
-        { name: 'ottl', direction: 'both' },
-        { name: 'sid', direction: 'both' },
-        { name: 'cl', direction: 'both' },
-        { name: 'cem', direction: 'both' },
-      ],
-    },
-  },
-  ...['small_orders', 'medium_orders', 'special_orders', 'large_orders'].map(
-    (name, index) => ({
-      id: name,
-      type: 'tableNode',
-      position: { x: 320, y: -80 + index * 110 },
-      data: {
-        tableName: name,
-        variant: 'green',
-        fields: [
-          { name: 'oid', direction: 'in' },
-          { name: 'ottl', direction: 'in' },
-          { name: 'sid', direction: 'in' },
-          { name: 'cid', direction: 'in' },
-        ],
-      },
-    })
-  ),
-  {
-    id: 'scott_dept',
-    type: 'tableNode',
-    position: { x: -520, y: 420 },
-    data: {
-      tableName: 'scott.dept',
-      variant: 'green',
-      fields: [{ name: 'deptno', direction: 'out' }],
-    },
-  },
-  {
-    id: 'scott_emp',
-    type: 'tableNode',
-    position: { x: -320, y: 520 },
-    data: {
-      tableName: 'scott.emp',
-      variant: 'green',
-      fields: [
-        { name: 'sal', direction: 'out' },
-        { name: 'deptno', direction: 'out' },
-      ],
-    },
-  },
-  {
-    id: 'result_a',
-    type: 'tableNode',
-    position: { x: 100, y: 460 },
-    data: {
-      tableName: 'RESULT_OF_A-1',
-      variant: 'orange',
-      fields: [
-        { name: 'deptno', direction: 'both' },
-        { name: 'num_emp', direction: 'both' },
-        { name: 'sal_sum', direction: 'both' },
-      ],
-    },
-  },
-  {
-    id: 'result_b',
-    type: 'tableNode',
-    position: { x: 100, y: 640 },
-    data: {
-      tableName: 'RESULT_OF_B-1',
-      variant: 'orange',
-      fields: [{ name: 'total_count', direction: 'out' }],
-    },
-  },
-  {
-    id: 'rs_dashboard',
-    type: 'tableNode',
-    position: { x: 460, y: 560 },
-    data: {
-      tableName: 'RS-1',
-      variant: 'magenta',
-      fields: [
-        { name: 'Department', direction: 'in' },
-        { name: 'Employees', direction: 'in' },
-        { name: 'Salary', direction: 'in' },
-      ],
-    },
-  },
-].map(enhanceNode))
-
-const createFieldEdge = (
-  source: string,
-  sourceField: string,
-  target: string,
-  targetField: string
-): Edge<LineageEdgeData> => ({
-  id: `${source}-${sourceField}__${target}-${targetField}`,
-  source,
-  target,
-  sourceHandle: `${source}-${sourceField}-out`,
-  targetHandle: `${target}-${targetField}-in`,
+const createEdgeFromDTO = (edge: LineageEdgeDTO): Edge<LineageEdgeData> => ({
+  id: edge.id,
+  source: edge.source,
+  target: edge.target,
+  sourceHandle: `${edge.source}-${edge.sourceField}-out`,
+  targetHandle: `${edge.target}-${edge.targetField}-in`,
   type: 'smoothstep',
   markerEnd: MarkerType.ArrowClosed,
-  animated: true,
-  data: { sourceField, targetField },
+  data: {
+    sourceField: edge.sourceField,
+    targetField: edge.targetField,
+  },
 })
-
-const baseEdges: Edge<LineageEdgeData>[] = [
-  createFieldEdge('customers', 'credit_limit', 'insert_select', 'cl'),
-  createFieldEdge('customers', 'cust_email', 'insert_select', 'cem'),
-  createFieldEdge('orders', 'order_id', 'insert_select', 'oid'),
-  createFieldEdge('orders', 'customer_id', 'insert_select', 'cid'),
-  createFieldEdge('orders', 'order_total', 'insert_select', 'ottl'),
-  createFieldEdge('orders', 'sales_rep_id', 'insert_select', 'sid'),
-  ...['small_orders', 'medium_orders', 'special_orders', 'large_orders'].flatMap((target) =>
-    ['oid', 'ottl', 'sid', 'cid'].map((field) => createFieldEdge('insert_select', field, target, field))
-  ),
-  createFieldEdge('insert_select', 'cl', 'special_orders', 'cid'),
-  createFieldEdge('insert_select', 'cem', 'special_orders', 'cid'),
-  createFieldEdge('scott_dept', 'deptno', 'result_a', 'deptno'),
-  createFieldEdge('scott_emp', 'deptno', 'result_a', 'deptno'),
-  createFieldEdge('scott_emp', 'sal', 'result_a', 'sal_sum'),
-  createFieldEdge('result_a', 'deptno', 'rs_dashboard', 'Department'),
-  createFieldEdge('result_a', 'num_emp', 'rs_dashboard', 'Employees'),
-  createFieldEdge('result_a', 'sal_sum', 'rs_dashboard', 'Salary'),
-  createFieldEdge('result_b', 'total_count', 'rs_dashboard', 'Employees'),
-]
-
-type Neighbor = { key: string; edgeId: string }
-const downstreamMap = new Map<string, Neighbor[]>()
-const upstreamMap = new Map<string, Neighbor[]>()
-
-const fieldKey = (nodeId: string, field: string) => `${nodeId}:${field}`
 
 const registerNeighbor = (map: Map<string, Neighbor[]>, fromKey: string, toKey: string, edgeId: string) => {
   const list = map.get(fromKey) ?? []
@@ -242,24 +112,22 @@ const registerNeighbor = (map: Map<string, Neighbor[]>, fromKey: string, toKey: 
   map.set(fromKey, list)
 }
 
-baseEdges.forEach((edge) => {
-  const sourceField = edge.data?.sourceField
-  const targetField = edge.data?.targetField
-  if (!sourceField || !targetField) return
+const rebuildAdjacency = () => {
+  downstreamMap.clear()
+  upstreamMap.clear()
+  baseEdges.forEach((edge) => {
+    const sourceField = edge.data?.sourceField
+    const targetField = edge.data?.targetField
+    if (!sourceField || !targetField) return
 
-  const sourceKey = fieldKey(edge.source, sourceField)
-  const targetKey = fieldKey(edge.target, targetField)
-  registerNeighbor(downstreamMap, sourceKey, targetKey, edge.id)
-  registerNeighbor(upstreamMap, targetKey, sourceKey, edge.id)
-})
+    const sourceKey = fieldKey(edge.source, sourceField)
+    const targetKey = fieldKey(edge.target, targetField)
+    registerNeighbor(downstreamMap, sourceKey, targetKey, edge.id)
+    registerNeighbor(upstreamMap, targetKey, sourceKey, edge.id)
+  })
+}
 
-const edges = ref<Edge<LineageEdgeData>[]>([])
-
-const highlights = computed(() => [
-  { label: '同步频率', value: '15 次/分钟' },
-  { label: '表级节点', value: `${nodes.value.length}` },
-  { label: '最新更新', value: '5 分钟前' },
-])
+const fieldKey = (nodeId: string, field: string) => `${nodeId}:${field}`
 
 const getFieldsForNode = (nodeId: string) => {
   const target = nodes.value.find((node) => node.id === nodeId)
@@ -386,6 +254,68 @@ watch(
   },
   { deep: true, immediate: true }
 )
+
+const highlights = computed(() => [
+  { label: 'CSV 文件', value: datasetStats.value.fileCount.toString() },
+  { label: '表级节点', value: datasetStats.value.nodeCount.toString() },
+  { label: '字段连线', value: datasetStats.value.edgeCount.toString() },
+])
+
+const hydrateNodes = (graph: LineageGraphDTO): Node<InteractiveTableNodeData>[] => {
+  const positions = computeNodePositions(graph)
+  return graph.nodes.map((node, index) =>
+    attachInteractions({
+      id: node.id,
+      type: 'tableNode',
+      position: positions.get(node.id) ?? { x: index * 260, y: index * 80 },
+      data: {
+        tableName: node.label,
+        variant: pickVariant(index),
+        fields: node.fields,
+      },
+    })
+  )
+}
+
+const loadLineage = async () => {
+  isLoading.value = true
+  loadError.value = null
+  try {
+    const graph = await fetchLineageGraph()
+    datasetStats.value = {
+      fileCount: graph.fileCount,
+      nodeCount: graph.nodes.length,
+      edgeCount: graph.edges.length,
+      updatedAt: graph.generatedAt,
+    }
+    nodes.value = hydrateNodes(graph)
+    baseEdges = graph.edges.map((edge) => createEdgeFromDTO(edge))
+    rebuildAdjacency()
+    selectedContext.value = null
+    updateHighlights()
+    await nextTick()
+    try {
+      fitView({ duration: 500, padding: 0.25 })
+    } catch {
+      // VueFlow 还未准备好时忽略
+    }
+  } catch (error) {
+    loadError.value = (error as Error).message || '读取血缘数据失败'
+    nodes.value = []
+    baseEdges = []
+    edges.value = []
+  } finally {
+    isLoading.value = false
+  }
+}
+
+const handleRetry = () => {
+  loadLineage()
+}
+
+onMounted(() => {
+  loadLineage()
+})
 </script>
 
 <template>
@@ -393,9 +323,12 @@ watch(
     <div class="home__intro">
       <div>
         <p class="home__eyebrow">数据血缘总览</p>
-        <h1>从源到指标的端到端可视化</h1>
+        <h1>从 result CSV 自动构建血缘图</h1>
         <p class="home__desc">
-          VueFlow 画布用来展示各层数据表之间的依赖关系，帮助数据团队快速定位影响范围、验证任务状态并发现潜在风险。
+          VueFlow 画布基于 result 目录下的 CSV 文件实时生成血缘关系，新增或删除文件后刷新即可查看最新依赖。
+        </p>
+        <p v-if="datasetStats.updatedAt" class="home__desc home__desc--muted">
+          最近生成时间：{{ new Date(datasetStats.updatedAt).toLocaleString() }}
         </p>
       </div>
 
@@ -405,6 +338,14 @@ watch(
           <strong class="home__metrics-value">{{ item.value }}</strong>
         </li>
       </ul>
+    </div>
+
+    <div v-if="isLoading" class="home__status">
+      正在读取 CSV 文件并计算血缘...
+    </div>
+    <div v-else-if="loadError" class="home__status home__status--error">
+      <p>{{ loadError }}</p>
+      <button type="button" class="home__status-btn" @click="handleRetry">重新加载</button>
     </div>
 
     <div class="home__canvas">
@@ -467,6 +408,11 @@ watch(
   max-width: 38rem;
 }
 
+.home__desc--muted {
+  color: #94a3b8;
+  font-size: 0.9rem;
+}
+
 .home__metrics {
   list-style: none;
   display: flex;
@@ -513,5 +459,35 @@ watch(
   height: 100%;
   position: absolute;
   inset: 0;
+}
+
+.home__status {
+  padding: 0.9rem 1.1rem;
+  border-radius: 12px;
+  border: 1px solid #d6dae6;
+  background: #fff;
+  color: #1e1b4b;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+}
+
+.home__status--error {
+  border-color: #fecaca;
+  color: #b91c1c;
+  background: #fff1f2;
+}
+
+.home__status-btn {
+  margin-top: 0.6rem;
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  border: none;
+  background: #4f46e5;
+  color: #fff;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.home__status-btn:hover {
+  background: #4338ca;
 }
 </style>

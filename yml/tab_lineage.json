@@ -1,0 +1,12 @@
+[
+  {
+    "entityType": "dataset",
+    "entityUrn": "urn:li:dataset:(urn:li:dataPlatform:oracle,BTARS_DATACORE.BTARS_RMB_CURRENT_ACCOUNT_TEMP,PROD)",
+    "changeType": "UPSERT",
+    "aspectName": "upstreamLineage",
+    "aspect": {
+      "value": "{\"upstreams\": [{\"dataset\": \"urn:li:dataset:(urn:li:dataPlatform:oracle,smtmods.l_publ_org_bra,PROD)\", \"type\": \"TRANSFORMED\"}]}",
+      "contentType": "application/json"
+    }
+  }
+]

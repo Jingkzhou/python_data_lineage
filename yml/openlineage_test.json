@@ -1,0 +1,58 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-11-11T03:20:00Z",
+  "run": {
+    "runId": "test-run-btars-001"
+  },
+  "job": {
+    "namespace": "btars_demo",
+    "name": "insert_btars_rmb_current_account_temp"
+  },
+  "inputs": [
+    {
+      "namespace": "oracle://smtmods",
+      "name": "l_publ_org_bra",
+      "facets": {
+        "schema": {
+          "_producer": "custom",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
+          "fields": [
+            { "name": "BANK_CD", "type": "STRING" }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "namespace": "hive://btars_datacore",
+      "name": "btars_rmb_current_account_temp",
+      "facets": {
+        "schema": {
+          "_producer": "custom",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
+          "fields": [
+            { "name": "BANK_CODE", "type": "STRING" }
+          ]
+        },
+        "columnLineage": {
+          "_producer": "custom",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "BANK_CODE": {
+              "inputFields": [
+                {
+                  "namespace": "oracle://smtmods",
+                  "name": "l_publ_org_bra",
+                  "field": "BANK_CD"
+                }
+              ],
+              "transformationDescription": "COPY t1.BANK_CD"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "producer": "https://github.com/OpenLineage/OpenLineage"
+}
