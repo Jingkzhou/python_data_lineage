@@ -245,3 +245,6 @@ SystemError: java.lang.ClassNotFoundException: org.jpype.classloader.DynamicClas
 ```
 cp /usr/share/java/org.jpype.jar /usr/lib/python3/dist-packages/org.jpype.jar
 ```
+
+
+python3 -m datahub ingest -c column_lineage.yml

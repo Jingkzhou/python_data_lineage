@@ -1,3 +1,4 @@
+from __future__ import annotations
 import re
 import logging
 import os
@@ -5,10 +6,18 @@ import subprocess
 import glob
 import shutil
 import csv
-import pymysql
+import json
+try:
+    import pymysql
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    pymysql = None
 
 SQLFLOW_CHAR_LIMIT = int(os.getenv("SQLFLOW_CHAR_LIMIT", "10000"))
 EXPECTED_LINEAGE_COLUMNS = 14
+DATAHUB_PLATFORM = os.getenv("DATAHUB_PLATFORM", "oracle")
+DATAHUB_ENV = os.getenv("DATAHUB_ENV", "PROD")
+DATAHUB_OUTPUT = os.getenv("DATAHUB_OUTPUT", "column_lineage.json")
+DATAHUB_LOWER_CASE = os.getenv("DATAHUB_LOWER_CASE", "true").lower() in ('1', 'true', 'yes', 'y')
 
 _FULLWIDTH_TRANS = str.maketrans({
     '（': '(',
@@ -753,6 +762,148 @@ def _normalize_lineage_row(row: list[str]) -> list[str] | None:
     logging.warning(f"无法纠正 CSV 行列数：{len(row)} 列，期望 {EXPECTED_LINEAGE_COLUMNS}。数据：{row}")
     return None
 
+
+def _strip_identifier(value: str | None) -> str:
+    if not value:
+        return ''
+    result = value.strip().strip('"').strip('`')
+    if result.startswith('[') and result.endswith(']') and len(result) > 2:
+        result = result[1:-1]
+    return result
+
+
+def _normalize_name(name: str | None) -> str:
+    stripped = _strip_identifier(name)
+    if not stripped:
+        return ''
+    return stripped.lower() if DATAHUB_LOWER_CASE else stripped
+
+
+def _compose_dataset_name(schema: str | None, table: str | None) -> str:
+    table_part = _strip_identifier(table)
+    schema_part = _strip_identifier(schema)
+    if not table_part:
+        return ''
+    if '.' in table_part:
+        dataset = table_part
+    elif schema_part and schema_part.lower() != 'default':
+        dataset = f"{schema_part}.{table_part}"
+    else:
+        dataset = table_part
+    return dataset.lower() if DATAHUB_LOWER_CASE else dataset
+
+
+def _build_dataset_urn(dataset_name: str) -> str:
+    return f"urn:li:dataset:(urn:li:dataPlatform:{DATAHUB_PLATFORM},{dataset_name},{DATAHUB_ENV})"
+
+
+def _prepare_column_name(column: str | None) -> str:
+    cleaned = _strip_identifier(column)
+    if not cleaned:
+        return ''
+    if any(ch in cleaned for ch in ' ()'):
+        return ''
+    return cleaned.lower() if DATAHUB_LOWER_CASE else cleaned
+
+
+def _build_field_urn(dataset_urn: str, column_name: str) -> str:
+    return f"urn:li:schemaField:({dataset_urn},{column_name})"
+
+
+def _map_transform_operation(relation_type: str | None) -> str:
+    mapping = {
+        'direct': 'copy',
+        'lookup': 'lookup',
+        'copy': 'copy'
+    }
+    if relation_type:
+        lowered = relation_type.lower()
+        return mapping.get(lowered, 'transform')
+    return 'transform'
+
+
+def export_datahub_lineage(chunk_dir: str, output_path: str = DATAHUB_OUTPUT) -> None:
+    csv_files = sorted(glob.glob(os.path.join(chunk_dir, '*.csv')))
+    if not csv_files:
+        logging.warning("无 CSV 可用于生成 DataHub JSON。")
+        return
+
+    lineage_map: dict[str, dict] = {}
+    skipped_rows = 0
+    for path in csv_files:
+        with open(path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                source_db = (row.get('SOURCE_DB') or '').strip()
+                if source_db.lower() == 'error log:':
+                    continue
+                source_dataset_name = _compose_dataset_name(row.get('SOURCE_SCHEMA'), row.get('SOURCE_TABLE'))
+                target_dataset_name = _compose_dataset_name(row.get('TARGET_SCHEMA'), row.get('TARGET_TABLE'))
+                if not source_dataset_name or not target_dataset_name:
+                    skipped_rows += 1
+                    continue
+
+                source_dataset_urn = _build_dataset_urn(source_dataset_name)
+                lineage_entry = lineage_map.setdefault(
+                    target_dataset_name,
+                    {
+                        'dataset_urn': _build_dataset_urn(target_dataset_name),
+                        'upstreams': set(),
+                        'fine_grained': set()
+                    }
+                )
+                lineage_entry['upstreams'].add(source_dataset_urn)
+
+                src_col = _prepare_column_name(row.get('SOURCE_COLUMN'))
+                tgt_col = _prepare_column_name(row.get('TARGET_COLUMN'))
+                if src_col and tgt_col:
+                    src_field_urn = _build_field_urn(source_dataset_urn, src_col)
+                    tgt_field_urn = _build_field_urn(lineage_entry['dataset_urn'], tgt_col)
+                    op = _map_transform_operation(row.get('RELATION_TYPE'))
+                    lineage_entry['fine_grained'].add((src_field_urn, tgt_field_urn, op))
+                else:
+                    skipped_rows += 1
+
+    payload = []
+    for target_name in sorted(lineage_map.keys()):
+        info = lineage_map[target_name]
+        upstreams = [
+            {"dataset": dataset_urn, "type": "TRANSFORMED"}
+            for dataset_urn in sorted(info['upstreams'])
+        ]
+        fine_grained = [
+            {
+                "upstreams": [src_urn],
+                "downstreams": [tgt_urn],
+                "upstreamType": "FIELD_SET",
+                "downstreamType": "FIELD_SET",
+                "transformOperation": op
+            }
+            for src_urn, tgt_urn, op in sorted(info['fine_grained'])
+        ]
+        aspect_value = {"upstreams": upstreams}
+        if fine_grained:
+            aspect_value["fineGrainedLineages"] = fine_grained
+        payload.append({
+            "entityType": "dataset",
+            "entityUrn": info['dataset_urn'],
+            "changeType": "UPSERT",
+            "aspectName": "upstreamLineage",
+            "aspect": {
+                "value": json.dumps(aspect_value, ensure_ascii=False),
+                "contentType": "application/json"
+            }
+        })
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logging.info(f"已生成 DataHub JSON：{output_path}，包含 {len(payload)} 个数据集。跳过 {skipped_rows} 行。")
+
 # ---------- 主流程 ----------
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO,
@@ -807,63 +958,69 @@ if __name__ == '__main__':
 
     # 将每个存储过程的 CSV 汇总到 result 目录
     export_result_csvs(chunk_dir, result_dir='result')
+
+    # 输出 DataHub JSON（列级血缘）
+    export_datahub_lineage(chunk_dir, output_path=DATAHUB_OUTPUT)
     
     
-    # MySQL 连接配置
-    conn = pymysql.connect(
-        host='127.0.0.1',
-        user='root',
-        password='a8548879',
-        database='lineage',
-        charset='utf8mb4'
-    )
-    cursor = conn.cursor()
+    if pymysql is None:
+        logging.warning("未安装 PyMySQL，跳过 MySQL 导入步骤。可执行 `pip install pymysql` 启用该功能。")
+    else:
+        # MySQL 连接配置
+        conn = pymysql.connect(
+            host='127.0.0.1',
+            user='root',
+            password='a8548879',
+            database='lineage',
+            charset='utf8mb4'
+        )
+        cursor = conn.cursor()
 
-    csv_files = glob.glob('chunks/*.csv')
-    # 插入前清空表
-    cursor.execute("TRUNCATE TABLE lineage_table;")
-    conn.commit()
-    print("lineage_table 已清空，开始批量导入...")
-    csv_files = glob.glob('chunks/*.csv')
-    for csv_file in csv_files:
-        base = os.path.splitext(os.path.basename(csv_file))[0]
-        sql_file = os.path.join('chunks', base + '.sql')
-        with open(sql_file, 'r', encoding='utf-8') as f_sql:
-            sql_content = f_sql.read()
-        with open(csv_file, 'r', encoding='utf-8') as f_csv:
-            reader = csv.reader(f_csv)
-            header = next(reader)
-            # 明确插入顺序为表的所有字段顺序
-            fields = [
-                'SOURCE_DB', 'SOURCE_SCHEMA', 'SOURCE_TABLE_ID', 'SOURCE_TABLE',
-                'SOURCE_COLUMN_ID', 'SOURCE_COLUMN', 'TARGET_DB', 'TARGET_SCHEMA',
-                'TARGET_TABLE_ID', 'TARGET_TABLE', 'TARGET_COLUMN_ID', 'TARGET_COLUMN',
-                'RELATION_TYPE', 'EFFECTTYPE', 'SQL_TEXT', 'FILE_NAME'
-            ]
-            placeholders = ','.join(['%s'] * len(fields))
-            insert_sql = f"INSERT INTO lineage_table ({','.join(fields)}) VALUES ({placeholders})"
-            for row in reader:
-                # row和字段严格对齐
-                # 如果遇到空行（或者全字段为空），跳出当前文件的插入循环
-                if not row or all(cell.strip() == '' for cell in row):
-                    print(f"遇到空行，跳过整个文件：{csv_file}")
-                    break   # 跳出本文件循环，继续下一个csv文件
-                normalized_row = _normalize_lineage_row(row)
-                if not normalized_row:
-                    print(f"无法解析列，跳过: {csv_file} 行内容: {row}")
-                    continue
-                row = normalized_row
-                ext_row = row + [sql_content, os.path.basename(sql_file)]
-                if len(ext_row) != len(fields):
-                    print(f"字段数量不一致，跳过: {csv_file} 行内容: {ext_row}")
-                    continue
-                try:
-                    cursor.execute(insert_sql, ext_row)
-                except Exception as e:
-                    print(f"插入出错: {e}\nSQL: {insert_sql}\n数据: {ext_row}")
-                    continue
-        print(f"{os.path.basename(csv_file)} 导入完成")
-
+        csv_files = glob.glob('chunks/*.csv')
+        # 插入前清空表
+        cursor.execute("TRUNCATE TABLE lineage_table;")
         conn.commit()
-    cursor.close()
-    conn.close()   
+        print("lineage_table 已清空，开始批量导入...")
+        csv_files = glob.glob('chunks/*.csv')
+        for csv_file in csv_files:
+            base = os.path.splitext(os.path.basename(csv_file))[0]
+            sql_file = os.path.join('chunks', base + '.sql')
+            with open(sql_file, 'r', encoding='utf-8') as f_sql:
+                sql_content = f_sql.read()
+            with open(csv_file, 'r', encoding='utf-8') as f_csv:
+                reader = csv.reader(f_csv)
+                header = next(reader)
+                # 明确插入顺序为表的所有字段顺序
+                fields = [
+                    'SOURCE_DB', 'SOURCE_SCHEMA', 'SOURCE_TABLE_ID', 'SOURCE_TABLE',
+                    'SOURCE_COLUMN_ID', 'SOURCE_COLUMN', 'TARGET_DB', 'TARGET_SCHEMA',
+                    'TARGET_TABLE_ID', 'TARGET_TABLE', 'TARGET_COLUMN_ID', 'TARGET_COLUMN',
+                    'RELATION_TYPE', 'EFFECTTYPE', 'SQL_TEXT', 'FILE_NAME'
+                ]
+                placeholders = ','.join(['%s'] * len(fields))
+                insert_sql = f"INSERT INTO lineage_table ({','.join(fields)}) VALUES ({placeholders})"
+                for row in reader:
+                    # row和字段严格对齐
+                    # 如果遇到空行（或者全字段为空），跳出当前文件的插入循环
+                    if not row or all(cell.strip() == '' for cell in row):
+                        print(f"遇到空行，跳过整个文件：{csv_file}")
+                        break   # 跳出本文件循环，继续下一个csv文件
+                    normalized_row = _normalize_lineage_row(row)
+                    if not normalized_row:
+                        print(f"无法解析列，跳过: {csv_file} 行内容: {row}")
+                        continue
+                    row = normalized_row
+                    ext_row = row + [sql_content, os.path.basename(sql_file)]
+                    if len(ext_row) != len(fields):
+                        print(f"字段数量不一致，跳过: {csv_file} 行内容: {ext_row}")
+                        continue
+                    try:
+                        cursor.execute(insert_sql, ext_row)
+                    except Exception as e:
+                        print(f"插入出错: {e}\nSQL: {insert_sql}\n数据: {ext_row}")
+                        continue
+            print(f"{os.path.basename(csv_file)} 导入完成")
+
+            conn.commit()
+        cursor.close()
+        conn.close()   
